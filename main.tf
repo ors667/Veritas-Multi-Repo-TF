@@ -71,6 +71,13 @@ resource "aws_kms_key" "veritas" {
         Resource  = "*"
       },
       {
+        Sid       = "AllowCloudWatchLogs"
+        Effect    = "Allow"
+        Principal = { Service = "logs.amazonaws.com" }
+        Action    = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]
+        Resource  = "*"
+      },
+      {
         Sid       = "DenyUnencryptedTransport"
         Effect    = "Deny"
         Principal = { AWS = "*" }
@@ -102,7 +109,7 @@ resource "aws_vpc" "veritas" {
 # PCI-DSS 10.2 / MiFID II audit requirements
 resource "aws_cloudwatch_log_group" "vpc_flow" {
   name              = "/aws/veritas/vpc-flow"
-  retention_in_days = 365
+  retention_in_days = 2555
   kms_key_id        = aws_kms_key.veritas.arn
 }
 
@@ -478,6 +485,7 @@ resource "aws_s3_bucket" "regulatory_archive" {
   bucket        = "veritas-regulatory-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "regulatory_archive" {
@@ -568,6 +576,7 @@ resource "aws_s3_bucket" "audit_logs" {
   bucket        = "veritas-audit-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-audit-logs", DataClass = "audit" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "audit_logs" {
@@ -608,7 +617,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "audit_logs" {
       storage_class = "GLACIER"
     }
     expiration { days = 2555 }  # 7 years
-    noncurrent_version_expiration { noncurrent_days = 90 }
+    noncurrent_version_expiration { noncurrent_days = 2555 }
   }
 }
 
@@ -767,10 +776,10 @@ resource "aws_iam_role_policy" "ingestor" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "SQSConsume"
-        Effect = "Allow"
-        Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"]
-        Resource = [aws_sqs_queue.trade_events.arn, aws_sqs_queue.submission_events.arn]
+        Sid      = "SQSConsume"
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.trade_events.arn
       },
       {
         Sid    = "SQSPublishSubmission"
@@ -817,7 +826,7 @@ resource "aws_iam_role_policy" "reporter" {
       {
         Sid    = "S3RegArchiveWrite"
         Effect = "Allow"
-        Action = ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
+        Action   = ["s3:PutObject"]
         Resource = ["${aws_s3_bucket.regulatory_archive.arn}", "${aws_s3_bucket.regulatory_archive.arn}/*"]
       },
       {
@@ -855,4 +864,48 @@ resource "aws_iam_role_policy" "flow_log" {
     Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = "*" }]
   })
+}
+
+resource "aws_sns_topic" "regulatory_affairs_topic" {
+  name              = "regulatory-affairs-${var.environment}"
+  kms_master_key_id = aws_kms_key.veritas.id
+}
+resource "aws_cloudwatch_metric_alarm" "submission_dlq_alarm" {
+  alarm_name          = "${var.environment}-submission-dlq-depth"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Monitors Submission DLQ depth and alerts on-call and Regulatory Affairs"
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    QueueName = aws_sqs_queue.trade_dlq.name
+  }
+}
+resource "aws_ec2_client_vpn_endpoint" "eks_client_vpn" {
+  description            = "Client VPN for EKS private API access"
+  server_certificate_arn = "arn:aws:acm:${var.aws_region}:111122223333:certificate/12345678-1234-1234-1234-123456789012"
+  client_cidr_block      = "10.255.0.0/22"
+  vpc_id                 = aws_vpc.veritas.id
+  security_group_ids     = [aws_security_group.eks_nodes.id]
+  split_tunnel           = true
+
+  authentication_options {
+    type                       = "certificate-authentication"
+    root_certificate_chain_arn = "arn:aws:acm:${var.aws_region}:111122223333:certificate/87654321-4321-4321-4321-210987654321"
+  }
+
+  connection_log_options {
+    enabled              = true
+    cloudwatch_log_group = aws_cloudwatch_log_group.vpc_flow.name
+  }
+
+  tags = {
+    Name        = "eks_client_vpn"
+    Environment = var.environment
+  }
 }
