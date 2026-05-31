@@ -102,7 +102,7 @@ resource "aws_vpc" "veritas" {
 # PCI-DSS 10.2 / MiFID II audit requirements
 resource "aws_cloudwatch_log_group" "vpc_flow" {
   name              = "/aws/veritas/vpc-flow"
-  retention_in_days = 365
+  retention_in_days = 2555
   kms_key_id        = aws_kms_key.veritas.arn
 }
 
@@ -350,6 +350,7 @@ resource "aws_rds_cluster" "trade_ledger" {
   }
 
   tags = { Name = "veritas-trade-ledger", DataClass = "trade-data" }
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.aurora_ssl_parameter_group.name
 }
 
 resource "aws_rds_cluster_instance" "trade_ledger" {
@@ -457,7 +458,7 @@ resource "aws_sqs_queue" "submission_events" {
   kms_master_key_id          = aws_kms_key.veritas.arn
 
   redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.trade_dlq.arn
+    deadLetterTargetArn = aws_sqs_queue.submission_dlq.arn
     maxReceiveCount     = 5
   })
 
@@ -478,6 +479,7 @@ resource "aws_s3_bucket" "regulatory_archive" {
   bucket        = "veritas-regulatory-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "regulatory_archive" {
@@ -568,6 +570,7 @@ resource "aws_s3_bucket" "audit_logs" {
   bucket        = "veritas-audit-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-audit-logs", DataClass = "audit" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "audit_logs" {
@@ -855,4 +858,69 @@ resource "aws_iam_role_policy" "flow_log" {
     Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = "*" }]
   })
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "audit_logs_object_lock" {
+  bucket = aws_s3_bucket.audit_logs.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 7
+    }
+  }
+}
+resource "aws_sns_topic" "regulatory_affairs_topic" {
+  name              = "veritas-regulatory-affairs-${var.environment}"
+  kms_master_key_id = aws_kms_key.veritas.id
+
+  tags = {
+    Environment = var.environment
+  }
+}
+resource "aws_s3_bucket_object_lock_configuration" "regulatory_archive" {
+  bucket = aws_s3_bucket.regulatory_archive.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 10
+    }
+  }
+}
+resource "aws_sqs_queue" "submission_dlq" {
+  name                      = "submission-dlq-${var.environment}"
+  kms_master_key_id         = aws_kms_key.veritas.id
+  message_retention_seconds = 1209600
+}
+resource "aws_rds_cluster_parameter_group" "aurora_ssl_parameter_group" {
+  name        = "${var.environment}-aurora-ssl-pg"
+  family      = "aurora-postgresql14" # Adjust this to match your Aurora cluster's exact engine version
+  description = "Enforce SSL for Aurora connections"
+
+  parameter {
+    name         = "rds.force_ssl"
+    value        = "1"
+    apply_method = "pending-reboot"
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+resource "aws_cloudwatch_metric_alarm" "submission_dlq_alarm" {
+  alarm_name          = "${var.environment}-submission-dlq-depth"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_description   = "Monitors the DLQ depth for submission events"
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    QueueName = aws_sqs_queue.trade_dlq.name
+  }
 }
