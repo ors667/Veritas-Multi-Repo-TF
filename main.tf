@@ -477,7 +477,7 @@ resource "aws_sqs_queue" "submission_events" {
 resource "aws_s3_bucket" "regulatory_archive" {
   bucket        = "veritas-regulatory-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
-  tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr" }
+  tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr", E2E = "ken341" }
 }
 
 resource "aws_s3_bucket_versioning" "regulatory_archive" {
