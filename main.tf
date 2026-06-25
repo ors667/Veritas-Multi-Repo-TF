@@ -102,7 +102,7 @@ resource "aws_vpc" "veritas" {
 # PCI-DSS 10.2 / MiFID II audit requirements
 resource "aws_cloudwatch_log_group" "vpc_flow" {
   name              = "/aws/veritas/vpc-flow"
-  retention_in_days = 365
+  retention_in_days = 2557
   kms_key_id        = aws_kms_key.veritas.arn
 }
 
@@ -817,7 +817,7 @@ resource "aws_iam_role_policy" "reporter" {
       {
         Sid    = "S3RegArchiveWrite"
         Effect = "Allow"
-        Action = ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
+        Action   = ["s3:PutObject"]
         Resource = ["${aws_s3_bucket.regulatory_archive.arn}", "${aws_s3_bucket.regulatory_archive.arn}/*"]
       },
       {
