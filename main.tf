@@ -278,6 +278,16 @@ resource "aws_eks_node_group" "veritas" {
     aws_iam_role_policy_attachment.eks_cni_policy,
     aws_iam_role_policy_attachment.eks_ecr_policy,
   ]
+  tags = {
+    App                                      = "veritas"
+    Compliance                               = "mifid2-emir-dodd-frank-soc2"
+    DataClass                                = "confidential"
+    Environment                              = "prod"
+    ManagedBy                                = "terraform"
+    Product                                  = "Trade Reporting"
+    "k8s.io/cluster-autoscaler/enabled"      = "true"
+    "k8s.io/cluster-autoscaler/veritas-prod" = "owned"
+  }
 }
 
 resource "aws_launch_template" "eks_node" {
@@ -359,6 +369,7 @@ resource "aws_rds_cluster_instance" "trade_ledger" {
   instance_class     = "db.serverless"
   engine             = aws_rds_cluster.trade_ledger.engine
   engine_version     = aws_rds_cluster.trade_ledger.engine_version
+  availability_zone  = "us-east-1a"
 }
 
 resource "aws_db_subnet_group" "veritas" {
@@ -478,6 +489,7 @@ resource "aws_s3_bucket" "regulatory_archive" {
   bucket        = "veritas-regulatory-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "regulatory_archive" {
@@ -568,6 +580,7 @@ resource "aws_s3_bucket" "audit_logs" {
   bucket        = "veritas-audit-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-audit-logs", DataClass = "audit" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "audit_logs" {
@@ -855,4 +868,30 @@ resource "aws_iam_role_policy" "flow_log" {
     Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = "*" }]
   })
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "regulatory_archive_object_lock" {
+  bucket = aws_s3_bucket.regulatory_archive.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 10
+    }
+  }
+}
+resource "aws_sns_topic_subscription" "ops_alerts_subscription" {
+  topic_arn = aws_sns_topic.ops_alerts.arn
+  protocol  = "email"
+  endpoint  = "ops-alerts@veritas.com"
+}
+resource "aws_s3_bucket_object_lock_configuration" "audit_logs_object_lock" {
+  bucket = aws_s3_bucket.audit_logs.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 7
+    }
+  }
 }
