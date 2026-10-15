@@ -102,7 +102,7 @@ resource "aws_vpc" "veritas" {
 # PCI-DSS 10.2 / MiFID II audit requirements
 resource "aws_cloudwatch_log_group" "vpc_flow" {
   name              = "/aws/veritas/vpc-flow"
-  retention_in_days = 365
+  retention_in_days = 2557
   kms_key_id        = aws_kms_key.veritas.arn
 }
 
@@ -240,7 +240,7 @@ resource "aws_eks_cluster" "veritas" {
     subnet_ids              = aws_subnet.private[*].id
     endpoint_private_access = true
     endpoint_public_access  = false
-    security_group_ids      = [aws_security_group.eks_nodes.id]
+    security_group_ids      = [aws_security_group.eks_nodes.id, aws_security_group.vpn_api_access.id]
   }
 
   # Full control plane audit logging — MiFID II / PCI-DSS 10.2
@@ -350,6 +350,8 @@ resource "aws_rds_cluster" "trade_ledger" {
   }
 
   tags = { Name = "veritas-trade-ledger", DataClass = "trade-data" }
+  db_cluster_parameter_group_name     = aws_rds_cluster_parameter_group.aurora_ssl_enforce.name
+  iam_database_authentication_enabled = true
 }
 
 resource "aws_rds_cluster_instance" "trade_ledger" {
@@ -412,6 +414,7 @@ resource "aws_elasticache_replication_group" "ref_data" {
   }
 
   tags = { Name = "veritas-ref-data-cache" }
+  user_group_ids = ["veritas-redis-users"]
 }
 
 resource "aws_cloudwatch_log_group" "redis" {
@@ -457,7 +460,7 @@ resource "aws_sqs_queue" "submission_events" {
   kms_master_key_id          = aws_kms_key.veritas.arn
 
   redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.trade_dlq.arn
+    deadLetterTargetArn = aws_sqs_queue.submission_dlq.arn
     maxReceiveCount     = 5
   })
 
@@ -478,6 +481,7 @@ resource "aws_s3_bucket" "regulatory_archive" {
   bucket        = "veritas-regulatory-archive-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-regulatory-archive", DataClass = "regulatory", Retention = "10yr" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "regulatory_archive" {
@@ -539,7 +543,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "regulatory_archive" {
     id     = "noncurrent-cleanup"
     status = "Enabled"
     filter { prefix = "" }
-    noncurrent_version_expiration { noncurrent_days = 90 }
+    noncurrent_version_expiration { noncurrent_days = 3650 }
   }
 }
 
@@ -568,6 +572,7 @@ resource "aws_s3_bucket" "audit_logs" {
   bucket        = "veritas-audit-logs-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
   tags          = { Name = "veritas-audit-logs", DataClass = "audit" }
+  object_lock_enabled = true
 }
 
 resource "aws_s3_bucket_versioning" "audit_logs" {
@@ -608,7 +613,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "audit_logs" {
       storage_class = "GLACIER"
     }
     expiration { days = 2555 }  # 7 years
-    noncurrent_version_expiration { noncurrent_days = 90 }
+    noncurrent_version_expiration { noncurrent_days = 2555 }
   }
 }
 
@@ -855,4 +860,122 @@ resource "aws_iam_role_policy" "flow_log" {
     Version = "2012-10-17"
     Statement = [{ Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"], Resource = "*" }]
   })
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "audit_logs" {
+  bucket = aws_s3_bucket.audit_logs.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 7
+    }
+  }
+}
+resource "kubernetes_secret" "redis_auth_secret" {
+  metadata {
+    name = "redis-auth-secret"
+  }
+
+  type = "Opaque"
+
+  data = {
+    auth_token = "InitialStrongPassword123!"
+  }
+
+  lifecycle {
+    ignore_changes = [
+      data["auth_token"],
+    ]
+  }
+}
+resource "aws_rds_cluster_parameter_group" "aurora_ssl_enforce" {
+  name        = "aurora-ssl-enforce-${var.environment}"
+  family      = "aurora-postgresql14"
+  description = "Enforce SSL connections for Aurora cluster"
+
+  parameter {
+    name  = "rds.force_ssl"
+    value = "1"
+  }
+}
+resource "aws_sqs_queue" "submission_dlq" {
+  name                      = "submission-dlq-${var.environment}"
+  kms_master_key_id         = aws_kms_key.veritas.id
+  message_retention_seconds = 1209600
+}
+resource "aws_security_group" "vpn_api_access" {
+  name        = "${var.environment}-vpn-api-access"
+  description = "Security group to limit EKS API access to VPN"
+  vpc_id      = aws_vpc.veritas.id
+
+  ingress {
+    description = "Allow HTTPS traffic from VPN"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["10.254.0.0/16"] # Placeholder: update with actual VPN CIDR
+  }
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "${var.environment}-vpn-api-access"
+    Environment = var.environment
+  }
+}
+resource "aws_sns_topic_subscription" "ops_alerts_subscription" {
+  topic_arn = aws_sns_topic.ops_alerts.arn
+  protocol  = "email"
+  endpoint  = "ops-alerts@company.internal"
+}
+resource "aws_cloudwatch_metric_alarm" "submission_dlq_alarm" {
+  alarm_name          = "${var.environment}-submission-dlq-depth"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "Fires immediately when messages land in the submission dead-letter queue to prevent silent data loss"
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    QueueName = aws_sqs_queue.trade_dlq.name
+  }
+}
+resource "aws_sns_topic_policy" "ops_alerts_policy" {
+  arn = aws_sns_topic.ops_alerts.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowCloudWatchAlarms"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudwatch.amazonaws.com"
+        }
+        Action   = "sns:Publish"
+        Resource = aws_sns_topic.ops_alerts.arn
+      }
+    ]
+  })
+}
+resource "aws_s3_bucket_object_lock_configuration" "regulatory_archive" {
+  bucket = aws_s3_bucket.regulatory_archive.id
+
+  rule {
+    default_retention {
+      mode  = "COMPLIANCE"
+      years = 10
+    }
+  }
 }
