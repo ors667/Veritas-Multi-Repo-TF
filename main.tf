@@ -58,7 +58,7 @@ data "aws_availability_zones" "available" { state = "available" }
 resource "aws_kms_key" "veritas" {
   description             = "Veritas Trade Reporting — master encryption key"
   deletion_window_in_days = 30
-  enable_key_rotation     = true  # PCI-DSS 3.7.4 — annual rotation
+  enable_key_rotation     = false # PCI-DSS 3.7.4 — annual rotation
 
   policy = jsonencode({
     Version = "2012-10-17"
